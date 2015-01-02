@@ -36,7 +36,7 @@ type S3SplitFileOutput struct {
 // ConfigStruct for FileOutput plugin.
 type S3SplitFileOutputConfig struct {
 	// Base output file path.
-	// In-progress files go to <Path>/current/<dimensionPath>,
+	// In-flight files go to <Path>/current/<dimensionPath>
 	// finalized files go to <Path>/finalized/<dimensionPath>
 	Path string
 
@@ -181,9 +181,7 @@ func (o *S3SplitFileOutput) rotateFiles() (err error) {
 			if e := o.finalizeOne(fileInfo.name); e != nil {
 				err = e
 			}
-		} /* else {
-			fmt.Printf("No need to finalize %s\n", fileInfo.name)
-		} */
+		}
 	}
 	return
 }
@@ -328,15 +326,11 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 
 				if err != nil {
 					or.LogError(fmt.Errorf("Error writing message to %s: %s", fileInfo.name, err))
-				} /*else {
-					msgCounter++
-				}*/
+				}
 
 				if doRotate {
-					// Rotate fullFile
 					// Remove current file from the map (which will trigger the
 					// next record with this path to generate a new one)
-					//fmt.Printf("TODO: We should rotate '%s'\n", fileInfo.name)
 					delete(o.dimFiles, dimPath)
 					if e = o.finalizeOne(fileInfo.name); e != nil {
 						or.LogError(fmt.Errorf("Error finalizing %s: %s", fileInfo.name, e))
@@ -347,92 +341,16 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 			}
 
 			pack.Recycle()
-
-			// Trigger immediately when the message count threshold has been
-			// reached if a) the "OR" operator is in effect or b) the
-			// flushInterval is 0 or c) the flushInterval has already elapsed.
-			// at least once since the last flush.
-			// if msgCounter >= o.FlushCount {
-			// 	if !o.flushOpAnd || o.FlushInterval == 0 || intervalElapsed {
-			// 		// This will block until the other side is ready to accept
-			// 		// this batch, freeing us to start on the next one.
-			// 		o.batchChan <- outBatch
-			// 		outBatch = <-o.backChan
-			// 		msgCounter = 0
-			// 		intervalElapsed = false
-			// 		if timer != nil {
-			// 			timer.Reset(timerDuration)
-			// 		}
-			// 	}
-			// }
 		case <-o.timerChan:
 			//fmt.Printf("TODO: check for rotate by time\n")
 			if e = o.rotateFiles(); e != nil {
 				or.LogError(fmt.Errorf("Error rotating files by time: %s", e))
 			}
-
-			// if (o.flushOpAnd && msgCounter >= o.FlushCount) ||
-			// 	(!o.flushOpAnd && msgCounter > 0) {
-
-			// 	// This will block until the other side is ready to accept
-			// 	// this batch, freeing us to start on the next one.
-			// 	o.batchChan <- outBatch
-			// 	outBatch = <-o.backChan
-			// 	msgCounter = 0
-			// 	intervalElapsed = false
-			// } else {
-			// 	intervalElapsed = true
-			// }
 			timer.Reset(timerDuration)
 		}
 	}
 	wg.Done()
 }
-
-// Runs in a separate goroutine, waits for buffered data on the committer
-// channel, writes it out to the filesystem, and puts the now empty buffer on
-// the return channel for reuse.
-// func (o *S3SplitFileOutput) committer(or OutputRunner, wg *sync.WaitGroup) {
-// 	initBatch := make([]byte, 0, 10000)
-// 	o.backChan <- initBatch
-// 	var outBatch []byte
-// 	var err error
-
-// 	ok := true
-// 	hupChan := make(chan interface{})
-// 	notify.Start(RELOAD, hupChan)
-
-// 	for ok {
-// 		select {
-// 		case outBatch, ok = <-o.batchChan:
-// 			if !ok {
-// 				// Channel is closed => we're shutting down, exit cleanly.
-// 				break
-// 			}
-// 			n, err := o.file.Write(outBatch)
-// 			if err != nil {
-// 				or.LogError(fmt.Errorf("Can't write to %s: %s", o.Path, err))
-// 			} else if n != len(outBatch) {
-// 				or.LogError(fmt.Errorf("Truncated output for %s", o.Path))
-// 			} else {
-// 				o.file.Sync()
-// 			}
-// 			outBatch = outBatch[:0]
-// 			o.backChan <- outBatch
-// 		case <-hupChan:
-// 			o.file.Close()
-// 			if err = o.openFile(); err != nil {
-// 				// TODO: Need a way to handle this gracefully, see
-// 				// https://github.com/mozilla-services/heka/issues/38
-// 				panic(fmt.Sprintf("S3SplitFileOutput unable to reopen file '%s': %s",
-// 					o.Path, err))
-// 			}
-// 		}
-// 	}
-
-// 	o.file.Close()
-// 	wg.Done()
-// }
 
 func init() {
 	RegisterPlugin("S3SplitFileOutput", func() interface{} {
