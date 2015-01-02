@@ -11,8 +11,6 @@ import (
 	"fmt"
 	"strings"
 	. "github.com/mozilla-services/heka/pipeline"
-	"github.com/mozilla-services/heka/plugins"
-	"github.com/rafrombrc/go-notify"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -30,10 +28,6 @@ type SplitFileInfo struct {
 type S3SplitFileOutput struct {
 	*S3SplitFileOutputConfig
 	perm       os.FileMode
-	flushOpAnd bool
-	file       *os.File
-	batchChan  chan []byte
-	backChan   chan []byte
 	folderPerm os.FileMode
 	timerChan  <-chan time.Time
 	dimFiles   map[string]*SplitFileInfo
@@ -49,22 +43,12 @@ type S3SplitFileOutputConfig struct {
 	// Output file permissions (default "644").
 	Perm string
 
-	// Interval at which accumulated file data should be written to disk, in
-	// milliseconds (default 1000, i.e. 1 second). Set to 0 to disable.
+	// Interval at which we should check MaxFileAge for in-flight files.
 	FlushInterval uint32 `toml:"flush_interval"`
 
-	// Number of messages to accumulate until file data should be written to
-	// disk (default 1, minimum 1).
-	FlushCount uint32 `toml:"flush_count"`
-
-	// Operator describing how the two parameters "flush_interval" and
-	// "flush_count" are combined. Allowed values are "AND" or "OR" (default is
-	// "AND").
-	FlushOperator string `toml:"flush_operator"`
-
-	// Permissions to apply to directories created for FileOutput's parent
-	// directory if it doesn't exist.  Must be a string representation of an
-	// octal integer. Defaults to "700".
+	// Permissions to apply to directories created for output directories if
+	// they don't exist.  Must be a string representation of an octal integer.
+	// Defaults to "700".
 	FolderPerm string `toml:"folder_perm"`
 
 	// Specifies whether or not Heka's stream framing will be applied to the
@@ -82,6 +66,7 @@ type S3SplitFileOutputConfig struct {
 	MaxFileAge uint32 `toml:"max_file_age"`
 }
 
+// TODO: get these from a spec file instead of hard-coding.
 var acceptableChannels = map[string]bool{
 	"default": true,
 	"nightly": true,
@@ -93,8 +78,11 @@ var acceptableChannels = map[string]bool{
 
 var hostname, _ = os.Hostname()
 
+// Pattern to use for sanitizing path/file components.
 var cleanPattern = regexp.MustCompile("[^a-zA-Z0-9_/.]")
 
+// Names for the subdirectories to use for in-flight and finalized files. These
+// dirs are found under the main Path specified in the config.
 const (
 	stdCurrentDir = "current"
 	stdFinalizedDir = "finalized"
@@ -104,8 +92,6 @@ func (o *S3SplitFileOutput) ConfigStruct() interface{} {
 	return &S3SplitFileOutputConfig{
 		Perm:          "644",
 		FlushInterval: 1000,
-		FlushCount:    1,
-		FlushOperator: "AND",
 		FolderPerm:    "700",
 		MaxFileSize:   524288000,
 		MaxFileAge:    3600000,
@@ -130,15 +116,7 @@ func (o *S3SplitFileOutput) Init(config interface{}) (err error) {
 		return
 	}
 	o.perm = os.FileMode(intPerm)
-	if err = o.openFile(); err != nil {
-		err = fmt.Errorf("S3SplitFileOutput '%s' error opening file: %s", o.Path, err)
-		return
-	}
 
-	if conf.FlushCount < 1 {
-		err = fmt.Errorf("Parameter 'flush_count' must be greater than 0.")
-		return
-	}
 	if conf.MaxFileSize < 1 {
 		err = fmt.Errorf("Parameter 'max_file_size' must be greater than 0.")
 		return
@@ -148,34 +126,7 @@ func (o *S3SplitFileOutput) Init(config interface{}) (err error) {
 		return
 	}
 
-	switch conf.FlushOperator {
-	case "AND":
-		o.flushOpAnd = true
-	case "OR":
-		o.flushOpAnd = false
-	default:
-		err = fmt.Errorf("Parameter 'flush_operator' needs to be either 'AND' or 'OR', is currently: '%s'",
-			conf.FlushOperator)
-		return
-	}
-
 	o.dimFiles = map[string]*SplitFileInfo{}
-
-	// TODO: wat
-	o.batchChan = make(chan []byte)
-	o.backChan = make(chan []byte, 2) // Never block on the hand-back
-	return
-}
-
-func (o *S3SplitFileOutput) openFile() (err error) {
-	bigFile := filepath.Join(o.Path, "all")
-	if err = os.MkdirAll(o.Path, o.folderPerm); err != nil {
-		return fmt.Errorf("Can't create the basepath for the S3SplitFileOutput plugin: %s", err.Error())
-	}
-	if err = plugins.CheckWritePermission(o.Path); err != nil {
-		return
-	}
-	o.file, err = os.OpenFile(bigFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, o.perm)
 	return
 }
 
@@ -255,7 +206,6 @@ func (o *S3SplitFileOutput) getFinalizedFileName(fileName string) (fullPath stri
 }
 
 func (o *S3SplitFileOutput) finalizeOne(fileName string) (err error) {
-	//fmt.Printf("TODO: Finalize %s\n", fileName)
 	oldName := o.getCurrentFileName(fileName)
 	newName := o.getFinalizedFileName(fileName)
 	//fmt.Printf("Moving '%s' to '%s'\n", oldName, newName)
@@ -322,9 +272,8 @@ func (o *S3SplitFileOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 		}
 	}
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(1)
 	go o.receiver(or, &wg)
-	go o.committer(or, &wg)
 	wg.Wait()
 	return
 }
@@ -336,12 +285,9 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 		e               error
 		timer           *time.Timer
 		timerDuration   time.Duration
-		msgCounter      uint32
-		intervalElapsed bool
 		outBytes        []byte
 	)
 	ok := true
-	outBatch := make([]byte, 0, 10000)
 	inChan := or.InChan()
 
 	timerDuration = time.Duration(o.FlushInterval) * time.Millisecond
@@ -352,19 +298,15 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 		}
 	}
 
+	// TODO: listen for SIGHUP and finalize all current files.
+	//          see file_output.go for an example
+
 	for ok {
 		select {
 		case pack, ok = <-inChan:
 			if !ok {
-				// Closed inChan => we're shutting down, flush data
+				// Closed inChan => we're shutting down, finalize data files
 				o.finalizeAll()
-
-				// Do fileoutput stuff:
-				if len(outBatch) > 0 {
-					o.batchChan <- outBatch
-				}
-				close(o.batchChan)
-
 				break
 			}
 			dimPath := o.getDimPath(pack)
@@ -384,14 +326,11 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 				// Write to split file
 				doRotate, err := o.writeMessage(fileInfo.name, outBytes)
 
-				// Also write to "all" file (for testing):
-				outBatch = append(outBatch, outBytes...)
-
 				if err != nil {
 					or.LogError(fmt.Errorf("Error writing message to %s: %s", fileInfo.name, err))
-				} else {
+				} /*else {
 					msgCounter++
-				}
+				}*/
 
 				if doRotate {
 					// Rotate fullFile
@@ -413,37 +352,37 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 			// reached if a) the "OR" operator is in effect or b) the
 			// flushInterval is 0 or c) the flushInterval has already elapsed.
 			// at least once since the last flush.
-			if msgCounter >= o.FlushCount {
-				if !o.flushOpAnd || o.FlushInterval == 0 || intervalElapsed {
-					// This will block until the other side is ready to accept
-					// this batch, freeing us to start on the next one.
-					o.batchChan <- outBatch
-					outBatch = <-o.backChan
-					msgCounter = 0
-					intervalElapsed = false
-					if timer != nil {
-						timer.Reset(timerDuration)
-					}
-				}
-			}
+			// if msgCounter >= o.FlushCount {
+			// 	if !o.flushOpAnd || o.FlushInterval == 0 || intervalElapsed {
+			// 		// This will block until the other side is ready to accept
+			// 		// this batch, freeing us to start on the next one.
+			// 		o.batchChan <- outBatch
+			// 		outBatch = <-o.backChan
+			// 		msgCounter = 0
+			// 		intervalElapsed = false
+			// 		if timer != nil {
+			// 			timer.Reset(timerDuration)
+			// 		}
+			// 	}
+			// }
 		case <-o.timerChan:
 			//fmt.Printf("TODO: check for rotate by time\n")
 			if e = o.rotateFiles(); e != nil {
 				or.LogError(fmt.Errorf("Error rotating files by time: %s", e))
 			}
 
-			if (o.flushOpAnd && msgCounter >= o.FlushCount) ||
-				(!o.flushOpAnd && msgCounter > 0) {
+			// if (o.flushOpAnd && msgCounter >= o.FlushCount) ||
+			// 	(!o.flushOpAnd && msgCounter > 0) {
 
-				// This will block until the other side is ready to accept
-				// this batch, freeing us to start on the next one.
-				o.batchChan <- outBatch
-				outBatch = <-o.backChan
-				msgCounter = 0
-				intervalElapsed = false
-			} else {
-				intervalElapsed = true
-			}
+			// 	// This will block until the other side is ready to accept
+			// 	// this batch, freeing us to start on the next one.
+			// 	o.batchChan <- outBatch
+			// 	outBatch = <-o.backChan
+			// 	msgCounter = 0
+			// 	intervalElapsed = false
+			// } else {
+			// 	intervalElapsed = true
+			// }
 			timer.Reset(timerDuration)
 		}
 	}
@@ -453,47 +392,47 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 // Runs in a separate goroutine, waits for buffered data on the committer
 // channel, writes it out to the filesystem, and puts the now empty buffer on
 // the return channel for reuse.
-func (o *S3SplitFileOutput) committer(or OutputRunner, wg *sync.WaitGroup) {
-	initBatch := make([]byte, 0, 10000)
-	o.backChan <- initBatch
-	var outBatch []byte
-	var err error
+// func (o *S3SplitFileOutput) committer(or OutputRunner, wg *sync.WaitGroup) {
+// 	initBatch := make([]byte, 0, 10000)
+// 	o.backChan <- initBatch
+// 	var outBatch []byte
+// 	var err error
 
-	ok := true
-	hupChan := make(chan interface{})
-	notify.Start(RELOAD, hupChan)
+// 	ok := true
+// 	hupChan := make(chan interface{})
+// 	notify.Start(RELOAD, hupChan)
 
-	for ok {
-		select {
-		case outBatch, ok = <-o.batchChan:
-			if !ok {
-				// Channel is closed => we're shutting down, exit cleanly.
-				break
-			}
-			n, err := o.file.Write(outBatch)
-			if err != nil {
-				or.LogError(fmt.Errorf("Can't write to %s: %s", o.Path, err))
-			} else if n != len(outBatch) {
-				or.LogError(fmt.Errorf("Truncated output for %s", o.Path))
-			} else {
-				o.file.Sync()
-			}
-			outBatch = outBatch[:0]
-			o.backChan <- outBatch
-		case <-hupChan:
-			o.file.Close()
-			if err = o.openFile(); err != nil {
-				// TODO: Need a way to handle this gracefully, see
-				// https://github.com/mozilla-services/heka/issues/38
-				panic(fmt.Sprintf("S3SplitFileOutput unable to reopen file '%s': %s",
-					o.Path, err))
-			}
-		}
-	}
+// 	for ok {
+// 		select {
+// 		case outBatch, ok = <-o.batchChan:
+// 			if !ok {
+// 				// Channel is closed => we're shutting down, exit cleanly.
+// 				break
+// 			}
+// 			n, err := o.file.Write(outBatch)
+// 			if err != nil {
+// 				or.LogError(fmt.Errorf("Can't write to %s: %s", o.Path, err))
+// 			} else if n != len(outBatch) {
+// 				or.LogError(fmt.Errorf("Truncated output for %s", o.Path))
+// 			} else {
+// 				o.file.Sync()
+// 			}
+// 			outBatch = outBatch[:0]
+// 			o.backChan <- outBatch
+// 		case <-hupChan:
+// 			o.file.Close()
+// 			if err = o.openFile(); err != nil {
+// 				// TODO: Need a way to handle this gracefully, see
+// 				// https://github.com/mozilla-services/heka/issues/38
+// 				panic(fmt.Sprintf("S3SplitFileOutput unable to reopen file '%s': %s",
+// 					o.Path, err))
+// 			}
+// 		}
+// 	}
 
-	o.file.Close()
-	wg.Done()
-}
+// 	o.file.Close()
+// 	wg.Done()
+// }
 
 func init() {
 	RegisterPlugin("S3SplitFileOutput", func() interface{} {
