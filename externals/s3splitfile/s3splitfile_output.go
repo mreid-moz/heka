@@ -9,15 +9,22 @@ package s3splitfile
 import (
 	"errors"
 	"fmt"
+	"strings"
 	. "github.com/mozilla-services/heka/pipeline"
 	"github.com/mozilla-services/heka/plugins"
 	"github.com/rafrombrc/go-notify"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"sync"
 	"time"
 )
+
+type SplitFileInfo struct {
+	name string
+	lastUpdate time.Time
+}
 
 // Output plugin that writes message contents to a file on the file system.
 type S3SplitFileOutput struct {
@@ -29,11 +36,12 @@ type S3SplitFileOutput struct {
 	backChan   chan []byte
 	folderPerm os.FileMode
 	timerChan  <-chan time.Time
+	dimFiles   map[string]*SplitFileInfo
 }
 
 // ConfigStruct for FileOutput plugin.
 type S3SplitFileOutputConfig struct {
-	// Full output file path.
+	// Base output file path.
 	Path string
 
 	// Output file permissions (default "644").
@@ -71,6 +79,19 @@ type S3SplitFileOutputConfig struct {
 	// file and begin writing to another one (default 60 * 60 * 1000, i.e. 1hr).
 	MaxFileAge uint32 `toml:"max_file_age"`
 }
+
+var acceptableChannels = map[string]bool{
+	"default": true,
+	"nightly": true,
+	"aurora": true,
+	"beta": true,
+	"release": true,
+	"esr": true,
+}
+
+var hostname, _ = os.Hostname()
+
+var cleanPattern = regexp.MustCompile("[^a-zA-Z0-9_/.]")
 
 func (o *S3SplitFileOutput) ConfigStruct() interface{} {
 	return &S3SplitFileOutputConfig{
@@ -131,6 +152,8 @@ func (o *S3SplitFileOutput) Init(config interface{}) (err error) {
 		return
 	}
 
+	o.dimFiles = map[string]*SplitFileInfo{}
+
 	// TODO: wat
 	o.batchChan = make(chan []byte)
 	o.backChan = make(chan []byte, 2) // Never block on the hand-back
@@ -138,15 +161,94 @@ func (o *S3SplitFileOutput) Init(config interface{}) (err error) {
 }
 
 func (o *S3SplitFileOutput) openFile() (err error) {
-	basePath := filepath.Dir(o.Path)
-	if err = os.MkdirAll(basePath, o.folderPerm); err != nil {
+	bigFile := filepath.Join(o.Path, "all")
+	if err = os.MkdirAll(o.Path, o.folderPerm); err != nil {
 		return fmt.Errorf("Can't create the basepath for the S3SplitFileOutput plugin: %s", err.Error())
 	}
-	if err = plugins.CheckWritePermission(basePath); err != nil {
+	if err = plugins.CheckWritePermission(o.Path); err != nil {
 		return
 	}
-	o.file, err = os.OpenFile(o.Path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, o.perm)
+	o.file, err = os.OpenFile(bigFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, o.perm)
 	return
+}
+
+func (o *S3SplitFileOutput) writeMessage(fileName string, msgBytes []byte) (rotate bool, err error) {
+	rotate = false
+	f, e := os.OpenFile(fileName, os.O_WRONLY|os.O_APPEND|os.O_CREATE, o.perm)
+	if e != nil {
+		return rotate, e
+	}
+	defer f.Close()
+
+	n, e := f.Write(msgBytes)
+	if e != nil {
+		return rotate, fmt.Errorf("Can't write to %s: %s", fileName, e)
+	} else if n != len(msgBytes) {
+		return rotate, fmt.Errorf("Truncated output for %s", fileName)
+	} else {
+		f.Sync()
+
+		if fi, e := f.Stat(); e != nil {
+			return rotate, e
+		} else {
+			if fi.Size() >= int64(o.MaxFileSize) {
+				rotate = true
+			}
+		}
+	}
+	return
+}
+
+func (o *S3SplitFileOutput) cleanDim(dim string) (cleaned string) {
+	return cleanPattern.ReplaceAllString(dim, "_")
+}
+
+func (o *S3SplitFileOutput) finalize() (err error) {
+	for dimPath, fileInfo := range o.dimFiles {
+		fmt.Printf("Finalizing %s (%s)\n", dimPath, fileInfo.name)
+	}
+	return
+}
+
+func (o *S3SplitFileOutput) getNewFilename() (name string) {
+	// Mon Jan 2 15:04:05 -0700 MST 2006
+	return fmt.Sprintf("%s_%s", time.Now().UTC().Format("20060102150405"), hostname)
+}
+
+func (o *S3SplitFileOutput) getDimPath(pack *PipelinePack) (dimPath string) {
+	dims := []string{"UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN"}
+	remaining := len(dims)
+	for _, field := range pack.Message.Fields {
+		if remaining == 0 {
+			break
+		}
+		// TODO: schema-powered, not hard-coded.
+		idx := -1
+		dim := field.GetValue().(string)
+		switch field.GetName()  {
+		case "submissionDate":
+			idx = 0
+		case "sourceName":
+			idx = 1
+		case "sourceVersion":
+			idx = 2
+		case "appName":
+			idx = 3
+		case "appUpdateChannel":
+			idx = 4
+            if !acceptableChannels[dim] {
+				dim = "OTHER"
+            }
+		case "appVersion":
+			idx = 5
+		}
+		if idx >= 0 {
+			dims[idx] = dim
+			remaining -= 1
+		}
+    }
+
+    return strings.Join(dims, "/")
 }
 
 func (o *S3SplitFileOutput) Run(or OutputRunner, h PluginHelper) (err error) {
@@ -169,9 +271,7 @@ func (o *S3SplitFileOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 	return
 }
 
-// Runs in a separate goroutine, accepting incoming messages, buffering output
-// data until the ticker triggers the buffered data should be put onto the
-// committer channel.
+// Runs in a separate goroutine, accepting incoming messages
 func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 	var (
 		pack            *PipelinePack
@@ -199,18 +299,55 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 		case pack, ok = <-inChan:
 			if !ok {
 				// Closed inChan => we're shutting down, flush data
-				if len(outBatch) > 0 {
-					o.batchChan <- outBatch
-				}
-				close(o.batchChan)
+				o.finalize()
 				break
 			}
+			dimPath := o.getDimPath(pack)
+			fileInfo, ok := o.dimFiles[dimPath]
+			if !ok {
+				fileInfo = &SplitFileInfo{
+					name:       filepath.Join(dimPath, o.getNewFilename()),
+					lastUpdate: time.Now().UTC(),
+				}
+				o.dimFiles[dimPath] = fileInfo
+			}
+
+			fullPath := filepath.Join(o.Path, dimPath)
+			fullFile := filepath.Join(o.Path, fileInfo.name)
+
+			if err := os.MkdirAll(fullPath, o.folderPerm); err != nil {
+				or.LogError(fmt.Errorf("S3SplitFileOutput can't create file path '%s': %s", fullPath, err))
+			}
+
+			// TODO: write to fullFile
+			// open fullFile
+			// write
+			// if f.tell() > max size
+			//    remove the entry from o.dimFiles
+			//    rotate
+			// close fullFile
+
+			fmt.Printf("TODO: write message to %s\n", fullFile)
+
+			// Encode the message
 			if outBytes, e = or.Encode(pack); e != nil {
 				or.LogError(e)
 			} else if outBytes != nil {
-				outBatch = append(outBatch, outBytes...)
-				msgCounter++
+				doRotate, err := o.writeMessage(fullFile, outBytes)
+				if err != nil {
+					or.LogError(fmt.Errorf("Error writing message to %s: %s", fullFile, err))
+				} else {
+					msgCounter++
+				}
+
+				if doRotate {
+					// Rotate fullFile
+					fmt.Printf("TODO: We should rotate '%s'\n", fullFile)
+				} else {
+					fmt.Printf("We should NOT rotate '%s'\n", fullFile)
+				}
 			}
+
 			pack.Recycle()
 
 			// Trigger immediately when the message count threshold has been
@@ -231,6 +368,7 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 				}
 			}
 		case <-o.timerChan:
+			fmt.Printf("TODO: check for rotate by time\n")
 			if (o.flushOpAnd && msgCounter >= o.FlushCount) ||
 				(!o.flushOpAnd && msgCounter > 0) {
 
@@ -246,6 +384,7 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 			timer.Reset(timerDuration)
 		}
 	}
+	fmt.Printf("All Done?\n")
 	wg.Done()
 }
 
