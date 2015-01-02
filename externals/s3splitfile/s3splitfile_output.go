@@ -42,6 +42,8 @@ type S3SplitFileOutput struct {
 // ConfigStruct for FileOutput plugin.
 type S3SplitFileOutputConfig struct {
 	// Base output file path.
+	// In-progress files go to <Path>/current/<dimensionPath>,
+	// finalized files go to <Path>/finalized/<dimensionPath>
 	Path string
 
 	// Output file permissions (default "644").
@@ -92,6 +94,11 @@ var acceptableChannels = map[string]bool{
 var hostname, _ = os.Hostname()
 
 var cleanPattern = regexp.MustCompile("[^a-zA-Z0-9_/.]")
+
+const (
+	stdCurrentDir = "current"
+	stdFinalizedDir = "finalized"
+)
 
 func (o *S3SplitFileOutput) ConfigStruct() interface{} {
 	return &S3SplitFileOutputConfig{
@@ -172,8 +179,15 @@ func (o *S3SplitFileOutput) openFile() (err error) {
 	return
 }
 
-func (o *S3SplitFileOutput) writeMessage(fileName string, msgBytes []byte) (rotate bool, err error) {
+func (o *S3SplitFileOutput) writeMessage(fileSuffix string, msgBytes []byte) (rotate bool, err error) {
 	rotate = false
+	fileName := o.getCurrentFileName(fileSuffix)
+	filePath := filepath.Dir(fileName)
+
+	if e := os.MkdirAll(filePath, o.folderPerm); e != nil {
+		return rotate, fmt.Errorf("S3SplitFileOutput can't create file path '%s': %s", filePath, e)
+	}
+
 	f, e := os.OpenFile(fileName, os.O_WRONLY|os.O_APPEND|os.O_CREATE, o.perm)
 	if e != nil {
 		return rotate, e
@@ -203,21 +217,60 @@ func (o *S3SplitFileOutput) cleanDim(dim string) (cleaned string) {
 	return cleanPattern.ReplaceAllString(dim, "_")
 }
 
-func (o *S3SplitFileOutput) finalize() (err error) {
-	for _, fileInfo := range o.dimFiles {
-		o.finalizeOne(fileInfo.name)
+func (o *S3SplitFileOutput) rotateFiles() (err error) {
+	var n = time.Now().UTC()
+	for dims, fileInfo := range o.dimFiles {
+		ageNanos := n.Sub(fileInfo.lastUpdate).Nanoseconds()
+		//fmt.Printf("Age: %d, Max: %d\n", ageNanos, int64(o.MaxFileAge) * 1000000)
+		if ageNanos > int64(o.MaxFileAge) * 1000000 {
+			// Remove old file from dimFiles
+			delete(o.dimFiles, dims)
+
+			// Then finalize it
+			if e := o.finalizeOne(fileInfo.name); e != nil {
+				err = e
+			}
+		} /* else {
+			fmt.Printf("No need to finalize %s\n", fileInfo.name)
+		} */
 	}
 	return
 }
 
-func (o *S3SplitFileOutput) finalizeOne(fileName string) (err error) {
-	fmt.Printf("TODO: Finalize %s\n", fileName)
+func (o *S3SplitFileOutput) finalizeAll() (err error) {
+	for _, fileInfo := range o.dimFiles {
+		if e := o.finalizeOne(fileInfo.name); e != nil {
+			err = e
+		}
+	}
 	return
+}
+
+func (o *S3SplitFileOutput) getCurrentFileName(fileName string) (fullPath string) {
+	return filepath.Join(o.Path, stdCurrentDir, fileName)
+}
+
+func (o *S3SplitFileOutput) getFinalizedFileName(fileName string) (fullPath string) {
+	return filepath.Join(o.Path, stdFinalizedDir, fileName)
+}
+
+func (o *S3SplitFileOutput) finalizeOne(fileName string) (err error) {
+	//fmt.Printf("TODO: Finalize %s\n", fileName)
+	oldName := o.getCurrentFileName(fileName)
+	newName := o.getFinalizedFileName(fileName)
+	//fmt.Printf("Moving '%s' to '%s'\n", oldName, newName)
+
+	newPath := filepath.Dir(newName)
+	if err = os.MkdirAll(newPath, o.folderPerm); err != nil {
+		return fmt.Errorf("S3SplitFileOutput can't create the finalized path %s: %s", newPath, err)
+	}
+
+	return os.Rename(oldName, newName)
 }
 
 func (o *S3SplitFileOutput) getNewFilename() (name string) {
 	// Mon Jan 2 15:04:05 -0700 MST 2006
-	return fmt.Sprintf("%s_%s", time.Now().UTC().Format("20060102150405"), hostname)
+	return fmt.Sprintf("%s_%s", time.Now().UTC().Format("20060102150405.000"), hostname)
 }
 
 func (o *S3SplitFileOutput) getDimPath(pack *PipelinePack) (dimPath string) {
@@ -304,7 +357,7 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 		case pack, ok = <-inChan:
 			if !ok {
 				// Closed inChan => we're shutting down, flush data
-				o.finalize()
+				o.finalizeAll()
 
 				// Do fileoutput stuff:
 				if len(outBatch) > 0 {
@@ -324,39 +377,34 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 				o.dimFiles[dimPath] = fileInfo
 			}
 
-			fullPath := filepath.Join(o.Path, dimPath)
-			fullFile := filepath.Join(o.Path, fileInfo.name)
-
-			if err := os.MkdirAll(fullPath, o.folderPerm); err != nil {
-				or.LogError(fmt.Errorf("S3SplitFileOutput can't create file path '%s': %s", fullPath, err))
-			}
-
-			//fmt.Printf("TODO: write message to %s\n", fullFile)
-
 			// Encode the message
 			if outBytes, e = or.Encode(pack); e != nil {
 				or.LogError(e)
 			} else if outBytes != nil {
 				// Write to split file
-				doRotate, err := o.writeMessage(fullFile, outBytes)
+				doRotate, err := o.writeMessage(fileInfo.name, outBytes)
 
 				// Also write to "all" file (for testing):
 				outBatch = append(outBatch, outBytes...)
 
 				if err != nil {
-					or.LogError(fmt.Errorf("Error writing message to %s: %s", fullFile, err))
+					or.LogError(fmt.Errorf("Error writing message to %s: %s", fileInfo.name, err))
 				} else {
 					msgCounter++
 				}
 
 				if doRotate {
 					// Rotate fullFile
-					fmt.Printf("TODO: We should rotate '%s'\n", fullFile)
-				} else {
-					fmt.Printf("We should NOT rotate '%s'\n", fullFile)
+					// Remove current file from the map (which will trigger the
+					// next record with this path to generate a new one)
+					//fmt.Printf("TODO: We should rotate '%s'\n", fileInfo.name)
+					delete(o.dimFiles, dimPath)
+					if e = o.finalizeOne(fileInfo.name); e != nil {
+						or.LogError(fmt.Errorf("Error finalizing %s: %s", fileInfo.name, e))
+					}
 				}
 			} else {
-				or.LogError(fmt.Errorf("Zero-byte message... wth?"))
+				or.LogError(fmt.Errorf("Zero-byte message... why?"))
 			}
 
 			pack.Recycle()
@@ -379,7 +427,11 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 				}
 			}
 		case <-o.timerChan:
-			fmt.Printf("TODO: check for rotate by time\n")
+			//fmt.Printf("TODO: check for rotate by time\n")
+			if e = o.rotateFiles(); e != nil {
+				or.LogError(fmt.Errorf("Error rotating files by time: %s", e))
+			}
+
 			if (o.flushOpAnd && msgCounter >= o.FlushCount) ||
 				(!o.flushOpAnd && msgCounter > 0) {
 
@@ -395,7 +447,6 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 			timer.Reset(timerDuration)
 		}
 	}
-	fmt.Printf("All Done?\n")
 	wg.Done()
 }
 
