@@ -204,9 +204,14 @@ func (o *S3SplitFileOutput) cleanDim(dim string) (cleaned string) {
 }
 
 func (o *S3SplitFileOutput) finalize() (err error) {
-	for dimPath, fileInfo := range o.dimFiles {
-		fmt.Printf("Finalizing %s (%s)\n", dimPath, fileInfo.name)
+	for _, fileInfo := range o.dimFiles {
+		o.finalizeOne(fileInfo.name)
 	}
+	return
+}
+
+func (o *S3SplitFileOutput) finalizeOne(fileName string) (err error) {
+	fmt.Printf("TODO: Finalize %s\n", fileName)
 	return
 }
 
@@ -300,6 +305,13 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 			if !ok {
 				// Closed inChan => we're shutting down, flush data
 				o.finalize()
+
+				// Do fileoutput stuff:
+				if len(outBatch) > 0 {
+					o.batchChan <- outBatch
+				}
+				close(o.batchChan)
+
 				break
 			}
 			dimPath := o.getDimPath(pack)
@@ -319,21 +331,18 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 				or.LogError(fmt.Errorf("S3SplitFileOutput can't create file path '%s': %s", fullPath, err))
 			}
 
-			// TODO: write to fullFile
-			// open fullFile
-			// write
-			// if f.tell() > max size
-			//    remove the entry from o.dimFiles
-			//    rotate
-			// close fullFile
-
-			fmt.Printf("TODO: write message to %s\n", fullFile)
+			//fmt.Printf("TODO: write message to %s\n", fullFile)
 
 			// Encode the message
 			if outBytes, e = or.Encode(pack); e != nil {
 				or.LogError(e)
 			} else if outBytes != nil {
+				// Write to split file
 				doRotate, err := o.writeMessage(fullFile, outBytes)
+
+				// Also write to "all" file (for testing):
+				outBatch = append(outBatch, outBytes...)
+
 				if err != nil {
 					or.LogError(fmt.Errorf("Error writing message to %s: %s", fullFile, err))
 				} else {
@@ -346,6 +355,8 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 				} else {
 					fmt.Printf("We should NOT rotate '%s'\n", fullFile)
 				}
+			} else {
+				or.LogError(fmt.Errorf("Zero-byte message... wth?"))
 			}
 
 			pack.Recycle()
