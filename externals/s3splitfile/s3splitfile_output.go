@@ -19,6 +19,7 @@ import (
 	"time"
 )
 
+// Info for a single split file
 type SplitFileInfo struct {
 	name       string
 	lastUpdate time.Time
@@ -35,7 +36,7 @@ type S3SplitFileOutput struct {
 	dimFiles   map[string]*SplitFileInfo
 }
 
-// ConfigStruct for FileOutput plugin.
+// ConfigStruct for S3SplitFileOutput plugin.
 type S3SplitFileOutputConfig struct {
 	// Base output file path.
 	// In-flight files go to <Path>/current/<dimensionPath>
@@ -135,20 +136,12 @@ func (o *S3SplitFileOutput) Init(config interface{}) (err error) {
 
 func (o *S3SplitFileOutput) writeMessage(fi *SplitFileInfo, msgBytes []byte) (rotate bool, err error) {
 	rotate = false
-	// fileName := o.getCurrentFileName(fileSuffix)
-	// filePath := filepath.Dir(fileName)
-
-	// if e := os.MkdirAll(filePath, o.folderPerm); e != nil {
-	// 	return rotate, fmt.Errorf("S3SplitFileOutput can't create file path '%s': %s", filePath, e)
-	// }
-
-	// f, e := os.OpenFile(fileName, os.O_WRONLY|os.O_APPEND|os.O_CREATE, o.perm)
-	// if e != nil {
-	// 	return rotate, e
-	// }
-	// defer f.Close()
-
 	n, e := fi.file.Write(msgBytes)
+
+	// Note that if these files are being written to elsewhere, the size-based
+	// rotation will not work as expected. A more robust approach would be to
+	// use something like `fi.file.Seek(0, os.SEEK_CUR)` to get the current
+	// offset into the file.
 	fi.size += uint32(n)
 
 	if e != nil {
@@ -156,15 +149,9 @@ func (o *S3SplitFileOutput) writeMessage(fi *SplitFileInfo, msgBytes []byte) (ro
 	} else if n != len(msgBytes) {
 		return rotate, fmt.Errorf("Truncated output for %s", fi.name)
 	} else {
-		//f.Sync()
-
-		// if fi, e := f.Stat(); e != nil {
-		// 	return rotate, e
-		// } else {
-			if fi.size >= o.MaxFileSize {
-				rotate = true
-			}
-		// }
+		if fi.size >= o.MaxFileSize {
+			rotate = true
+		}
 	}
 	return
 }
@@ -177,7 +164,6 @@ func (o *S3SplitFileOutput) rotateFiles() (err error) {
 	var n = time.Now().UTC()
 	for dims, fileInfo := range o.dimFiles {
 		ageNanos := n.Sub(fileInfo.lastUpdate).Nanoseconds()
-		//fmt.Printf("Age: %d, Max: %d\n", ageNanos, int64(o.MaxFileAge) * 1000000)
 		if ageNanos > int64(o.MaxFileAge) * 1000000 {
 			// Remove old file from dimFiles
 			delete(o.dimFiles, dims)
