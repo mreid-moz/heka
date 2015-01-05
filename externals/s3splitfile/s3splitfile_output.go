@@ -17,7 +17,6 @@ import (
 	"strconv"
 	"sync"
 	"time"
-//	"runtime/pprof"
 )
 
 type SplitFileInfo struct {
@@ -288,18 +287,10 @@ func (o *S3SplitFileOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 		}
 	}
 
-	profile, e := os.Create(filepath.Join(o.Path, "splitfile.prof"))
-    if e != nil {
-        err = e
-        return
-    }
-    pprof.StartCPUProfile(profile)
-
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go o.receiver(or, &wg)
 	wg.Wait()
-	pprof.StopCPUProfile()
 	return
 }
 
