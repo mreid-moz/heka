@@ -17,7 +17,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
-	"runtime/pprof"
+//	"runtime/pprof"
 )
 
 type SplitFileInfo struct {
@@ -184,7 +184,7 @@ func (o *S3SplitFileOutput) rotateFiles() (err error) {
 			delete(o.dimFiles, dims)
 
 			// Then finalize it
-			if e := o.finalizeOne(fileInfo.name); e != nil {
+			if e := o.finalizeOne(fileInfo); e != nil {
 				err = e
 			}
 		}
@@ -194,10 +194,21 @@ func (o *S3SplitFileOutput) rotateFiles() (err error) {
 
 func (o *S3SplitFileOutput) finalizeAll() (err error) {
 	for _, fileInfo := range o.dimFiles {
-		if e := o.finalizeOne(fileInfo.name); e != nil {
+		if e := o.finalizeOne(fileInfo); e != nil {
 			err = e
 		}
 	}
+	return
+}
+
+func (o *S3SplitFileOutput) openCurrent(fi *SplitFileInfo) (file *os.File, err error) {
+	fullName := o.getCurrentFileName(fi.name)
+	fullPath := filepath.Dir(fullName)
+	if err = os.MkdirAll(fullPath, o.folderPerm); err != nil {
+		return nil, fmt.Errorf("S3SplitFileOutput can't create path %s: %s", fullPath, err)
+	}
+
+	file, err = os.OpenFile(fullName, os.O_WRONLY|os.O_APPEND|os.O_CREATE, o.perm)
 	return
 }
 
@@ -209,9 +220,10 @@ func (o *S3SplitFileOutput) getFinalizedFileName(fileName string) (fullPath stri
 	return filepath.Join(o.Path, stdFinalizedDir, fileName)
 }
 
-func (o *S3SplitFileOutput) finalizeOne(fileName string) (err error) {
-	oldName := o.getCurrentFileName(fileName)
-	newName := o.getFinalizedFileName(fileName)
+func (o *S3SplitFileOutput) finalizeOne(fi *SplitFileInfo) (err error) {
+	fi.file.Close()
+	oldName := o.getCurrentFileName(fi.name)
+	newName := o.getFinalizedFileName(fi.name)
 	//fmt.Printf("Moving '%s' to '%s'\n", oldName, newName)
 
 	newPath := filepath.Dir(newName)
@@ -325,16 +337,16 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 			dimPath := o.getDimPath(pack)
 			fileInfo, ok := o.dimFiles[dimPath]
 			if !ok {
-				f, e := os.OpenFile(filepath.Join(o.Path, "t"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, o.perm)
-				if e != nil {
-					or.LogError(fmt.Errorf("Error opening file: %s", e))
-				}
 				fileInfo = &SplitFileInfo{
 					name:       filepath.Join(dimPath, o.getNewFilename()),
 					lastUpdate: time.Now().UTC(),
-					file:       f,
 					size:       0,
 				}
+				f, e := o.openCurrent(fileInfo)
+				if e != nil {
+					or.LogError(fmt.Errorf("Error opening file: %s", e))
+				}
+				fileInfo.file = f
 				o.dimFiles[dimPath] = fileInfo
 			}
 
@@ -352,9 +364,8 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 				if doRotate {
 					// Remove current file from the map (which will trigger the
 					// next record with this path to generate a new one)
-					fileInfo.file.Close()
 					delete(o.dimFiles, dimPath)
-					if e = o.finalizeOne(fileInfo.name); e != nil {
+					if e = o.finalizeOne(fileInfo); e != nil {
 						or.LogError(fmt.Errorf("Error finalizing %s: %s", fileInfo.name, e))
 					}
 				}
@@ -364,7 +375,6 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 
 			pack.Recycle()
 		case <-o.timerChan:
-			//fmt.Printf("TODO: check for rotate by time\n")
 			if e = o.rotateFiles(); e != nil {
 				or.LogError(fmt.Errorf("Error rotating files by time: %s", e))
 			}
