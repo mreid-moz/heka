@@ -9,12 +9,12 @@ package s3splitfile
 import (
 	"errors"
 	"fmt"
-	"strings"
 	. "github.com/mozilla-services/heka/pipeline"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -73,10 +73,10 @@ type S3SplitFileOutputConfig struct {
 var acceptableChannels = map[string]bool{
 	"default": true,
 	"nightly": true,
-	"aurora": true,
-	"beta": true,
+	"aurora":  true,
+	"beta":    true,
 	"release": true,
-	"esr": true,
+	"esr":     true,
 }
 
 var hostname, _ = os.Hostname()
@@ -87,7 +87,7 @@ var cleanPattern = regexp.MustCompile("[^a-zA-Z0-9_/.]")
 // Names for the subdirectories to use for in-flight and finalized files. These
 // dirs are found under the main Path specified in the config.
 const (
-	stdCurrentDir = "current"
+	stdCurrentDir   = "current"
 	stdFinalizedDir = "finalized"
 )
 
@@ -164,7 +164,7 @@ func (o *S3SplitFileOutput) rotateFiles() (err error) {
 	var n = time.Now().UTC()
 	for dims, fileInfo := range o.dimFiles {
 		ageNanos := n.Sub(fileInfo.lastUpdate).Nanoseconds()
-		if ageNanos > int64(o.MaxFileAge) * 1000000 {
+		if ageNanos > int64(o.MaxFileAge)*1000000 {
 			// Remove old file from dimFiles
 			delete(o.dimFiles, dims)
 
@@ -234,7 +234,7 @@ func (o *S3SplitFileOutput) getDimPath(pack *PipelinePack) (dimPath string) {
 		// TODO: schema-powered, not hard-coded.
 		idx := -1
 		dim := field.GetValue().(string)
-		switch field.GetName()  {
+		switch field.GetName() {
 		case "submissionDate":
 			idx = 0
 		case "sourceName":
@@ -245,9 +245,9 @@ func (o *S3SplitFileOutput) getDimPath(pack *PipelinePack) (dimPath string) {
 			idx = 3
 		case "appUpdateChannel":
 			idx = 4
-            if !acceptableChannels[dim] {
+			if !acceptableChannels[dim] {
 				dim = "OTHER"
-            }
+			}
 		case "appVersion":
 			idx = 5
 		}
@@ -255,9 +255,9 @@ func (o *S3SplitFileOutput) getDimPath(pack *PipelinePack) (dimPath string) {
 			dims[idx] = dim
 			remaining -= 1
 		}
-    }
+	}
 
-    return strings.Join(dims, "/")
+	return strings.Join(dims, "/")
 }
 
 func (o *S3SplitFileOutput) Run(or OutputRunner, h PluginHelper) (err error) {
@@ -283,11 +283,11 @@ func (o *S3SplitFileOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 // Runs in a separate goroutine, accepting incoming messages
 func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 	var (
-		pack            *PipelinePack
-		e               error
-		timer           *time.Timer
-		timerDuration   time.Duration
-		outBytes        []byte
+		pack          *PipelinePack
+		e             error
+		timer         *time.Timer
+		timerDuration time.Duration
+		outBytes      []byte
 	)
 	ok := true
 	inChan := or.InChan()
