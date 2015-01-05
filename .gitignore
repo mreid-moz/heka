@@ -6,5 +6,4 @@ etc/
 pipeline/mock_*.go
 var/
 *.sw?
-externals
 .DS_Store
