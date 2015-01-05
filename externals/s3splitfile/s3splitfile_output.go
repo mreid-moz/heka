@@ -17,11 +17,14 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"runtime/pprof"
 )
 
 type SplitFileInfo struct {
-	name string
+	name       string
 	lastUpdate time.Time
+	file       *os.File
+	size       uint32
 }
 
 // Output plugin that writes message contents to a file on the file system.
@@ -127,39 +130,42 @@ func (o *S3SplitFileOutput) Init(config interface{}) (err error) {
 	}
 
 	o.dimFiles = map[string]*SplitFileInfo{}
+
 	return
 }
 
-func (o *S3SplitFileOutput) writeMessage(fileSuffix string, msgBytes []byte) (rotate bool, err error) {
+func (o *S3SplitFileOutput) writeMessage(fi *SplitFileInfo, msgBytes []byte) (rotate bool, err error) {
 	rotate = false
-	fileName := o.getCurrentFileName(fileSuffix)
-	filePath := filepath.Dir(fileName)
+	// fileName := o.getCurrentFileName(fileSuffix)
+	// filePath := filepath.Dir(fileName)
 
-	if e := os.MkdirAll(filePath, o.folderPerm); e != nil {
-		return rotate, fmt.Errorf("S3SplitFileOutput can't create file path '%s': %s", filePath, e)
-	}
+	// if e := os.MkdirAll(filePath, o.folderPerm); e != nil {
+	// 	return rotate, fmt.Errorf("S3SplitFileOutput can't create file path '%s': %s", filePath, e)
+	// }
 
-	f, e := os.OpenFile(fileName, os.O_WRONLY|os.O_APPEND|os.O_CREATE, o.perm)
+	// f, e := os.OpenFile(fileName, os.O_WRONLY|os.O_APPEND|os.O_CREATE, o.perm)
+	// if e != nil {
+	// 	return rotate, e
+	// }
+	// defer f.Close()
+
+	n, e := fi.file.Write(msgBytes)
+	fi.size += uint32(n)
+
 	if e != nil {
-		return rotate, e
-	}
-	defer f.Close()
-
-	n, e := f.Write(msgBytes)
-	if e != nil {
-		return rotate, fmt.Errorf("Can't write to %s: %s", fileName, e)
+		return rotate, fmt.Errorf("Can't write to %s: %s", fi.name, e)
 	} else if n != len(msgBytes) {
-		return rotate, fmt.Errorf("Truncated output for %s", fileName)
+		return rotate, fmt.Errorf("Truncated output for %s", fi.name)
 	} else {
-		f.Sync()
+		//f.Sync()
 
-		if fi, e := f.Stat(); e != nil {
-			return rotate, e
-		} else {
-			if fi.Size() >= int64(o.MaxFileSize) {
+		// if fi, e := f.Stat(); e != nil {
+		// 	return rotate, e
+		// } else {
+			if fi.size >= o.MaxFileSize {
 				rotate = true
 			}
-		}
+		// }
 	}
 	return
 }
@@ -269,10 +275,19 @@ func (o *S3SplitFileOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 			or.SetUseFraming(true)
 		}
 	}
+
+	profile, e := os.Create(filepath.Join(o.Path, "splitfile.prof"))
+    if e != nil {
+        err = e
+        return
+    }
+    pprof.StartCPUProfile(profile)
+
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go o.receiver(or, &wg)
 	wg.Wait()
+	pprof.StopCPUProfile()
 	return
 }
 
@@ -310,9 +325,15 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 			dimPath := o.getDimPath(pack)
 			fileInfo, ok := o.dimFiles[dimPath]
 			if !ok {
+				f, e := os.OpenFile(filepath.Join(o.Path, "t"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, o.perm)
+				if e != nil {
+					or.LogError(fmt.Errorf("Error opening file: %s", e))
+				}
 				fileInfo = &SplitFileInfo{
 					name:       filepath.Join(dimPath, o.getNewFilename()),
 					lastUpdate: time.Now().UTC(),
+					file:       f,
+					size:       0,
 				}
 				o.dimFiles[dimPath] = fileInfo
 			}
@@ -322,7 +343,7 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 				or.LogError(e)
 			} else if outBytes != nil {
 				// Write to split file
-				doRotate, err := o.writeMessage(fileInfo.name, outBytes)
+				doRotate, err := o.writeMessage(fileInfo, outBytes)
 
 				if err != nil {
 					or.LogError(fmt.Errorf("Error writing message to %s: %s", fileInfo.name, err))
@@ -331,6 +352,7 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 				if doRotate {
 					// Remove current file from the map (which will trigger the
 					// next record with this path to generate a new one)
+					fileInfo.file.Close()
 					delete(o.dimFiles, dimPath)
 					if e = o.finalizeOne(fileInfo.name); e != nil {
 						or.LogError(fmt.Errorf("Error finalizing %s: %s", fileInfo.name, e))
