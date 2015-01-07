@@ -17,15 +17,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"io/ioutil"
+	"encoding/json"
 )
-
-// Info for a single split file
-type SplitFileInfo struct {
-	name       string
-	lastUpdate time.Time
-	file       *os.File
-	size       uint32
-}
 
 // Output plugin that writes message contents to a file on the file system.
 type S3SplitFileOutput struct {
@@ -34,6 +28,7 @@ type S3SplitFileOutput struct {
 	folderPerm os.FileMode
 	timerChan  <-chan time.Time
 	dimFiles   map[string]*SplitFileInfo
+	schema     Schema
 }
 
 // ConfigStruct for S3SplitFileOutput plugin.
@@ -45,6 +40,9 @@ type S3SplitFileOutputConfig struct {
 
 	// Output file permissions (default "644").
 	Perm string
+
+	// Path to Schema file (json). Defaults to using the standard schema.
+	SchemaFile string `toml:"schema_file"`
 
 	// Interval at which we should check MaxFileAge for in-flight files.
 	FlushInterval uint32 `toml:"flush_interval"`
@@ -69,14 +67,121 @@ type S3SplitFileOutputConfig struct {
 	MaxFileAge uint32 `toml:"max_file_age"`
 }
 
-// TODO: get these from a spec file instead of hard-coding.
-var acceptableChannels = map[string]bool{
-	"default": true,
-	"nightly": true,
-	"aurora":  true,
-	"beta":    true,
-	"release": true,
-	"esr":     true,
+// Info for a single split file
+type SplitFileInfo struct {
+	name       string
+	lastUpdate time.Time
+	file       *os.File
+	size       uint32
+}
+
+// Encapsulates the directory-splitting schema
+type Schema struct {
+	Fields []string
+	FieldIndices map[string]int
+	Dims map[string]DimensionChecker
+}
+
+// Determine whether a given value is acceptable for a given field, and if not
+// return a default value instead.
+func (o *Schema) GetValue(field string, value string) (rvalue string, err error) {
+	checker, ok := o.Dims[field]
+	if ok {
+		if checker.IsAllowed(value) {
+			return value, nil
+		} else {
+			return "OTHER", nil
+		}
+	}
+	return value, fmt.Errorf("No such field: '%s'", field)
+}
+
+// Extract all dimensions from the given pack.
+func (o *Schema) getDimensions(pack *PipelinePack) (dimensions []string) {
+	dims := make([]string, len(o.Fields))
+	for i, _ := range dims {
+		dims[i] = "UNKNOWN"
+	}
+
+	// TODO: add support for top-level message fields (Timestamp, etc)
+	remaining := len(dims)
+	for _, field := range pack.Message.Fields {
+		if remaining == 0 {
+			break
+		}
+
+		idx, ok := o.FieldIndices[field.GetName()]
+		if ok {
+			remaining -= 1
+			v, err := o.GetValue(field.GetName(), field.GetValue().(string))
+			if err != nil {
+				fmt.Printf("How did this happen? %s", err)
+			}
+			dims[idx] = v
+		}
+	}
+
+	return dims
+}
+
+// Interface for calculating whether a particular value is acceptable
+// as-is, or if it should be replaced with a default value.
+type DimensionChecker interface {
+	IsAllowed(v string) (bool)
+}
+
+// Accept any value at all.
+type AnyDimensionChecker struct {
+}
+func (o AnyDimensionChecker) IsAllowed(v string) (bool) {
+	return true
+}
+
+// Accept a specific list of values, anything not in the list
+// will not be accepted
+// TODO: use a map[string]bool for inclusion checking.
+type ListDimensionChecker struct {
+	// Use a map instead of a list internally for fast lookups.
+	allowed map[string]bool
+}
+func (o ListDimensionChecker) IsAllowed(v string) (bool) {
+	_, ok := o.allowed[v]
+	return ok
+	// for _, a := range o.allowed {
+	// 	if a == v {
+	// 		return true
+	// 	}
+	// }
+	// return false
+}
+
+// Factory for creating a ListDimensionChecker using a list instead of a map
+func NewListDimensionChecker(allowed []string) *ListDimensionChecker {
+	dimMap := map[string]bool{}
+	for _, a := range(allowed) {
+		dimMap[a] = true
+	}
+	return &ListDimensionChecker{dimMap}
+}
+
+// If both are specified, accept any value between `min` and `max` (inclusive).
+// If one of the bounds is missing, only enforce the other. If neither bound is
+// present, accept all values.
+type RangeDimensionChecker struct {
+	min string
+	max string
+}
+func (o RangeDimensionChecker) IsAllowed(v string) (bool) {
+	// Min and max are optional, so treat them separately.
+	if o.min != "" && o.min > v {
+		return false
+	}
+
+	if o.max != "" && o.max < v {
+		return false
+	}
+
+	return true
 }
 
 var hostname, _ = os.Hostname()
@@ -99,6 +204,60 @@ func (o *S3SplitFileOutput) ConfigStruct() interface{} {
 		MaxFileSize:   524288000,
 		MaxFileAge:    3600000,
 	}
+}
+
+func (o *S3SplitFileOutput) loadSchema(schemaFileName string) (schema Schema, err error) {
+	// Placeholder for parsing JSON
+	type JSchemaDimension struct {
+		Field_name string
+		Allowed_values interface{}
+	}
+
+	// Placeholder for parsing JSON
+	type JSchema struct {
+		Version int32
+		Dimensions []JSchemaDimension
+	}
+
+	schemaBytes, err := ioutil.ReadFile(schemaFileName)
+	if err != nil {
+		return
+	}
+
+	var js JSchema
+
+	err = json.Unmarshal(schemaBytes, &js)
+	if err != nil {
+		return
+	}
+
+	fields := make([]string, len(js.Dimensions))
+	fieldIndices := map[string]int{}
+	dims := map[string]DimensionChecker{}
+	schema = Schema{fields, fieldIndices, dims}
+
+	for i, d := range js.Dimensions {
+		schema.Fields[i] = d.Field_name
+		schema.FieldIndices[d.Field_name] = i
+		switch d.Allowed_values.(type) {
+		case string:
+			if d.Allowed_values.(string) == "*" {
+				schema.Dims[d.Field_name] = AnyDimensionChecker{}
+			} else {
+				schema.Dims[d.Field_name] = NewListDimensionChecker([]string{d.Allowed_values.(string)})
+			}
+		case []interface{}:
+			allowed := make([]string, len(d.Allowed_values.([]interface{})))
+			for i, v := range d.Allowed_values.([]interface{}) {
+				allowed[i] = v.(string)
+			}
+			schema.Dims[d.Field_name] = NewListDimensionChecker(allowed)
+		case map[string]interface{}:
+			vrange := d.Allowed_values.(map[string]interface{})
+			schema.Dims[d.Field_name] = RangeDimensionChecker{vrange["min"].(string), vrange["max"].(string)}
+		}
+	}
+	return
 }
 
 func (o *S3SplitFileOutput) Init(config interface{}) (err error) {
@@ -130,6 +289,18 @@ func (o *S3SplitFileOutput) Init(config interface{}) (err error) {
 	}
 
 	o.dimFiles = map[string]*SplitFileInfo{}
+
+	// TODO: fall back to default schema.
+	//fmt.Printf("schema_file = '%s'\n", conf.SchemaFile)
+	if conf.SchemaFile == "" {
+		err = fmt.Errorf("Parameter 'schema_file' is missing")
+		return
+	}
+
+	o.schema, err = o.loadSchema(conf.SchemaFile)
+	if err != nil {
+		err = fmt.Errorf("Parameter 'schema_file' must be a valid JSON file: %s", err)
+	}
 
 	return
 }
@@ -225,38 +396,7 @@ func (o *S3SplitFileOutput) getNewFilename() (name string) {
 }
 
 func (o *S3SplitFileOutput) getDimPath(pack *PipelinePack) (dimPath string) {
-	dims := []string{"UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN"}
-	remaining := len(dims)
-	for _, field := range pack.Message.Fields {
-		if remaining == 0 {
-			break
-		}
-		// TODO: schema-powered, not hard-coded.
-		idx := -1
-		dim := field.GetValue().(string)
-		switch field.GetName() {
-		case "submissionDate":
-			idx = 0
-		case "sourceName":
-			idx = 1
-		case "sourceVersion":
-			idx = 2
-		case "appName":
-			idx = 3
-		case "appUpdateChannel":
-			idx = 4
-			if !acceptableChannels[dim] {
-				dim = "OTHER"
-			}
-		case "appVersion":
-			idx = 5
-		}
-		if idx >= 0 {
-			dims[idx] = dim
-			remaining -= 1
-		}
-	}
-
+	dims := o.schema.getDimensions(pack)
 	return strings.Join(dims, "/")
 }
 
@@ -312,6 +452,7 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 				break
 			}
 			dimPath := o.getDimPath(pack)
+			// fmt.Printf("Found a path: %s\n", dimPath)
 			fileInfo, ok := o.dimFiles[dimPath]
 			if !ok {
 				fileInfo = &SplitFileInfo{
