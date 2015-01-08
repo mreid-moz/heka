@@ -84,21 +84,21 @@ type Schema struct {
 
 // Determine whether a given value is acceptable for a given field, and if not
 // return a default value instead.
-func (o *Schema) GetValue(field string, value string) (rvalue string, err error) {
-	checker, ok := o.Dims[field]
-	if ok {
-		if checker.IsAllowed(value) {
-			return value, nil
-		} else {
-			return "OTHER", nil
-		}
+func (s *Schema) GetValue(field string, value string) (rvalue string, err error) {
+	checker, ok := s.Dims[field]
+	if !ok {
+		return value, fmt.Errorf("No such field: '%s'", field)
 	}
-	return value, fmt.Errorf("No such field: '%s'", field)
+	if checker.IsAllowed(value) {
+		return value, nil
+	} else {
+		return "OTHER", nil
+	}
 }
 
 // Extract all dimensions from the given pack.
-func (o *Schema) getDimensions(pack *PipelinePack) (dimensions []string) {
-	dims := make([]string, len(o.Fields))
+func (s *Schema) getDimensions(pack *PipelinePack) (dimensions []string) {
+	dims := make([]string, len(s.Fields))
 	for i, _ := range dims {
 		dims[i] = "UNKNOWN"
 	}
@@ -110,14 +110,19 @@ func (o *Schema) getDimensions(pack *PipelinePack) (dimensions []string) {
 			break
 		}
 
-		idx, ok := o.FieldIndices[field.GetName()]
+		idx, ok := s.FieldIndices[field.GetName()]
 		if ok {
 			remaining -= 1
-			v, err := o.GetValue(field.GetName(), field.GetValue().(string))
-			if err != nil {
-				fmt.Printf("How did this happen? %s", err)
-			}
-			dims[idx] = v
+			inValues := field.GetValueString()
+			if len(inValues) > 0 {
+				// We use the first available value, even if several have been
+				// provided.
+				v, err := s.GetValue(field.GetName(), inValues[0])
+				if err != nil {
+					fmt.Printf("How did this happen? %s", err)
+				}
+				dims[idx] = v
+			} // Else there were no values, leave this field as unknown.
 		}
 	}
 
@@ -133,33 +138,26 @@ type DimensionChecker interface {
 // Accept any value at all.
 type AnyDimensionChecker struct {
 }
-func (o AnyDimensionChecker) IsAllowed(v string) (bool) {
+func (adc AnyDimensionChecker) IsAllowed(v string) (bool) {
 	return true
 }
 
 // Accept a specific list of values, anything not in the list
 // will not be accepted
-// TODO: use a map[string]bool for inclusion checking.
 type ListDimensionChecker struct {
 	// Use a map instead of a list internally for fast lookups.
-	allowed map[string]bool
+	allowed map[string]struct{}
 }
-func (o ListDimensionChecker) IsAllowed(v string) (bool) {
-	_, ok := o.allowed[v]
+func (ldc ListDimensionChecker) IsAllowed(v string) (bool) {
+	_, ok := ldc.allowed[v]
 	return ok
-	// for _, a := range o.allowed {
-	// 	if a == v {
-	// 		return true
-	// 	}
-	// }
-	// return false
 }
 
 // Factory for creating a ListDimensionChecker using a list instead of a map
 func NewListDimensionChecker(allowed []string) *ListDimensionChecker {
-	dimMap := map[string]bool{}
+	dimMap := map[string]struct{}{}
 	for _, a := range(allowed) {
-		dimMap[a] = true
+		dimMap[a] = struct{}{}
 	}
 	return &ListDimensionChecker{dimMap}
 }
@@ -171,13 +169,15 @@ type RangeDimensionChecker struct {
 	min string
 	max string
 }
-func (o RangeDimensionChecker) IsAllowed(v string) (bool) {
+func (rdc RangeDimensionChecker) IsAllowed(v string) (bool) {
 	// Min and max are optional, so treat them separately.
-	if o.min != "" && o.min > v {
+	// TODO: ensure that Go does string comparisons in the fashion expected
+	//       by this code.
+	if rdc.min != "" && rdc.min > v {
 		return false
 	}
 
-	if o.max != "" && o.max < v {
+	if rdc.max != "" && rdc.max < v {
 		return false
 	}
 
@@ -249,12 +249,24 @@ func (o *S3SplitFileOutput) loadSchema(schemaFileName string) (schema Schema, er
 		case []interface{}:
 			allowed := make([]string, len(d.Allowed_values.([]interface{})))
 			for i, v := range d.Allowed_values.([]interface{}) {
-				allowed[i] = v.(string)
+				allowedValue, ok := v.(string)
+				if !ok {
+					return schema, fmt.Errorf("Entries in 'allowed_values' for field '%s' must be strings", d.Field_name)
+				}
+				allowed[i] = allowedValue
 			}
 			schema.Dims[d.Field_name] = NewListDimensionChecker(allowed)
 		case map[string]interface{}:
 			vrange := d.Allowed_values.(map[string]interface{})
-			schema.Dims[d.Field_name] = RangeDimensionChecker{vrange["min"].(string), vrange["max"].(string)}
+			minStr, ok := vrange["min"].(string)
+			if !ok {
+				return schema, fmt.Errorf("Value of 'min' for field '%s' must be a string", d.Field_name)
+			}
+			maxStr, ok := vrange["max"].(string)
+			if !ok {
+				return schema, fmt.Errorf("Value of 'max' for field '%s' must be a string", d.Field_name)
+			}
+			schema.Dims[d.Field_name] = RangeDimensionChecker{minStr, maxStr}
 		}
 	}
 	return
