@@ -36,6 +36,7 @@ set(SBMGRLOAD_EXE "${PROJECT_PATH}/bin/heka-sbmgrload${CMAKE_EXECUTABLE_SUFFIX}"
 set(INJECT_EXE "${PROJECT_PATH}/bin/heka-inject${CMAKE_EXECUTABLE_SUFFIX}")
 set(LOGSTREAMER_EXE "${PROJECT_PATH}/bin/heka-logstreamer${CMAKE_EXECUTABLE_SUFFIX}")
 set(HEKA_CAT_EXE "${PROJECT_PATH}/bin/heka-cat${CMAKE_EXECUTABLE_SUFFIX}")
+set(HEKA_EXPORT_EXE "${PROJECT_PATH}/bin/heka-export${CMAKE_EXECUTABLE_SUFFIX}")
 
 option(INCLUDE_SANDBOX "Include Lua sandbox" on)
 option(INCLUDE_MOZSVC "Include the Mozilla services plugins" on)
@@ -212,6 +213,13 @@ DEPENDS hekad
 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 install(PROGRAMS "${HEKA_CAT_EXE}" DESTINATION bin)
+
+add_custom_target(heka-export ALL
+${GO_EXECUTABLE} install ${LDFLAGS} github.com/mozilla-services/heka/cmd/heka-export
+DEPENDS hekad
+WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+install(PROGRAMS "${HEKA_EXPORT_EXE}" DESTINATION bin)
 
 add_custom_target(sbmgr ALL
 ${GO_EXECUTABLE} install ${LDFLAGS} github.com/mozilla-services/heka/cmd/heka-sbmgr
