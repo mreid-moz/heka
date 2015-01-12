@@ -144,8 +144,8 @@ func main() {
 		os.Exit(3)
 	}
 
-	fmt.Printf("Base:%s  Pattern:%s  Bucket: s3://%s/%s  AWSKey:%s / %s  Region:%s  Dry Run:%t  Loop:%t\n",
-		*flagBase, *flagPattern, *flagBucket, *flagBucketPrefix, *flagAWSKey, *flagAWSSecretKey, *flagAWSRegion, *flagDryRun, *flagLoop)
+	// fmt.Printf("Base:%s  Pattern:%s  Bucket: s3://%s/%s  AWSKey:%s / %s  Region:%s  Dry Run:%t  Loop:%t\n",
+	// 	*flagBase, *flagPattern, *flagBucket, *flagBucketPrefix, *flagAWSKey, *flagAWSSecretKey, *flagAWSRegion, *flagDryRun, *flagLoop)
 
 	var progress Progress
 	var rate float64
