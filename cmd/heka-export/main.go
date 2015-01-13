@@ -101,6 +101,13 @@ func makeupload(base string, pattern *regexp.Regexp, bucket *s3.Bucket, bucketPr
 		// no upoad errors.
 		progress.Bytes += fi.Size()
 
+		err = reader.Close()
+		if err != nil {
+			fmt.Printf("Error closing %s: %s\n", path, err)
+			progress.Errors++
+			errOut = err
+		}
+
 		// Now remove the file locally.
 		err = os.Remove(path)
 		if err != nil {
