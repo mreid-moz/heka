@@ -19,6 +19,8 @@ import (
 	"time"
 	"io/ioutil"
 	"encoding/json"
+	"github.com/crowdmob/goamz/aws"
+	"github.com/crowdmob/goamz/s3"
 )
 
 // Output plugin that writes message contents to a file on the file system.
@@ -29,6 +31,8 @@ type S3SplitFileOutput struct {
 	timerChan  <-chan time.Time
 	dimFiles   map[string]*SplitFileInfo
 	schema     Schema
+	bucket     *s3.Bucket
+	publishChan chan string
 }
 
 // ConfigStruct for S3SplitFileOutput plugin.
@@ -65,6 +69,13 @@ type S3SplitFileOutputConfig struct {
 	// Specifies how long (in milliseconds) to wait before rotating the current
 	// file and begin writing to another one (default 60 * 60 * 1000, i.e. 1hr).
 	MaxFileAge uint32 `toml:"max_file_age"`
+
+	AWSKey string `toml:"aws_key"`
+	AWSSecretKey string `toml:"aws_secret_key"`
+	AWSRegion string `toml:"aws_region"`
+	S3Bucket string `toml:"s3_bucket"`
+	S3BucketPrefix string `toml:"s3_bucket_prefix"`
+	// TODO: S3WorkerCount int
 }
 
 // Info for a single split file
@@ -198,11 +209,16 @@ const (
 
 func (o *S3SplitFileOutput) ConfigStruct() interface{} {
 	return &S3SplitFileOutputConfig{
-		Perm:          "644",
-		FlushInterval: 1000,
-		FolderPerm:    "700",
-		MaxFileSize:   524288000,
-		MaxFileAge:    3600000,
+		Perm:           "644",
+		FlushInterval:  1000,
+		FolderPerm:     "700",
+		MaxFileSize:    524288000,
+		MaxFileAge:     3600000,
+		AWSKey:         "",
+		AWSSecretKey:   "",
+		AWSRegion:      "us-west-2",
+		S3Bucket:       "",
+		S3BucketPrefix: "",
 	}
 }
 
@@ -311,8 +327,25 @@ func (o *S3SplitFileOutput) Init(config interface{}) (err error) {
 
 	o.schema, err = o.loadSchema(conf.SchemaFile)
 	if err != nil {
-		err = fmt.Errorf("Parameter 'schema_file' must be a valid JSON file: %s", err)
+		return fmt.Errorf("Parameter 'schema_file' must be a valid JSON file: %s", err)
 	}
+
+	if conf.S3Bucket != "" {
+		auth := aws.Auth{AccessKey: conf.AWSKey, SecretKey: conf.AWSSecretKey}
+		region, ok := aws.Regions[conf.AWSRegion]
+		if !ok {
+			return fmt.Errorf("Parameter 'aws_region' must be a valid AWS Region")
+		}
+		s := s3.New(auth, region)
+		o.bucket = s.Bucket(conf.S3Bucket)
+	} else {
+		o.bucket = nil
+	}
+
+	// Remove any excess path separators from the bucket prefix.
+	conf.S3BucketPrefix = fmt.Sprintf("/%s", strings.Trim(conf.S3BucketPrefix, "/"))
+
+	o.publishChan = make(chan string, 1000)
 
 	return
 }
@@ -399,6 +432,9 @@ func (o *S3SplitFileOutput) finalizeOne(fi *SplitFileInfo) (err error) {
 		return fmt.Errorf("S3SplitFileOutput can't create the finalized path %s: %s", newPath, err)
 	}
 
+	// Queue finalized file up for publishing.
+	o.publishChan <- fi.name
+
 	return os.Rename(oldName, newName)
 }
 
@@ -428,6 +464,11 @@ func (o *S3SplitFileOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go o.receiver(or, &wg)
+	// Run a pool of concurrent publishers.
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go o.publisher(or, &wg)
+	}
 	wg.Wait()
 	return
 }
@@ -461,6 +502,7 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 			if !ok {
 				// Closed inChan => we're shutting down, finalize data files
 				o.finalizeAll()
+				close(o.publishChan)
 				break
 			}
 			dimPath := o.getDimPath(pack)
@@ -511,6 +553,60 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 			timer.Reset(timerDuration)
 		}
 	}
+	wg.Done()
+}
+
+func (o *S3SplitFileOutput) publisher(or OutputRunner, wg *sync.WaitGroup) {
+	// var err error
+	var pubFile string
+
+	ok := true
+
+	for ok {
+		select {
+		case pubFile, ok = <-o.publishChan:
+			if !ok {
+				// Channel is closed => we're shutting down, exit cleanly.
+				break
+			}
+
+			if o.bucket == nil {
+				or.LogMessage(fmt.Sprintf("Dude, where's my bucket: %s", pubFile))
+				continue
+			}
+
+			sourcePath := o.getFinalizedFileName(pubFile)
+			destPath := fmt.Sprintf("%s/%s", o.S3BucketPrefix, pubFile)
+			reader, err := os.Open(sourcePath)
+			// TODO: defer reader.close()
+			if err != nil {
+				or.LogError(fmt.Errorf("Error opening %s for reading: %s", sourcePath, err))
+				continue
+			}
+
+			fi, err := reader.Stat()
+			if err != nil {
+				or.LogError(fmt.Errorf("Error Stat'ing %s: %s", sourcePath, o.S3Bucket, destPath, err))
+				continue
+			}
+
+			err = o.bucket.PutReader(destPath, reader, fi.Size(), "binary/octet-stream", s3.BucketOwnerFull, s3.Options{})
+			if err != nil {
+				or.LogError(fmt.Errorf("Error publishing %s to s3://%s%s: %s", sourcePath, o.S3Bucket, destPath, err))
+				continue
+			}
+
+			or.LogMessage(fmt.Sprintf("Successfully published %s", pubFile))
+
+			err = os.Remove(sourcePath)
+			if err != nil {
+				or.LogError(fmt.Errorf("Error removing local file '%s' after publishing: %s", sourcePath, err))
+			}
+			or.LogMessage(fmt.Sprintf("Finished publishing %s", pubFile))
+
+		}
+	}
+
 	wg.Done()
 }
 
