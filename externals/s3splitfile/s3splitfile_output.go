@@ -561,6 +561,10 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 func (o *S3SplitFileOutput) publisher(or OutputRunner, wg *sync.WaitGroup) {
 	// var err error
 	var pubFile string
+	var startTime time.Time
+	var duration float64
+	var uploadMB float64
+	var uploadRate float64
 
 	ok := true
 
@@ -577,10 +581,12 @@ func (o *S3SplitFileOutput) publisher(or OutputRunner, wg *sync.WaitGroup) {
 				continue
 			}
 
+			// TODO: if we fail to publish a file, we should inject a failure
+			//       message back into the pipeline.
+
 			sourcePath := o.getFinalizedFileName(pubFile)
 			destPath := fmt.Sprintf("%s/%s", o.S3BucketPrefix, pubFile)
 			reader, err := os.Open(sourcePath)
-			// TODO: defer reader.close()
 			if err != nil {
 				or.LogError(fmt.Errorf("Error opening %s for reading: %s", sourcePath, err))
 				continue
@@ -592,14 +598,23 @@ func (o *S3SplitFileOutput) publisher(or OutputRunner, wg *sync.WaitGroup) {
 				continue
 			}
 
+			startTime = time.Now().UTC()
 			err = o.bucket.PutReader(destPath, reader, fi.Size(), "binary/octet-stream", s3.BucketOwnerFull, s3.Options{})
 			if err != nil {
 				or.LogError(fmt.Errorf("Error publishing %s to s3://%s%s: %s", sourcePath, o.S3Bucket, destPath, err))
 				// TODO: retry? add a struct for {name, numAttempts}, increment it, and push it back on the channel?
 				continue
 			}
+			duration = time.Now().UTC().Sub(startTime).Seconds()
 
-			or.LogMessage(fmt.Sprintf("Successfully published %s", pubFile))
+			uploadMB = float64(fi.Size()) / 1024.0 / 1024.0
+			if duration > 0 {
+				uploadRate = uploadMB / duration
+			} else {
+				uploadRate = 0
+			}
+
+			or.LogMessage(fmt.Sprintf("Successfully published %.2fMB in %.2fs (%.2fMB/s): %s", uploadMB, duration, uploadRate, pubFile))
 
 			err = reader.Close()
 			if err != nil {
@@ -610,8 +625,8 @@ func (o *S3SplitFileOutput) publisher(or OutputRunner, wg *sync.WaitGroup) {
 			if err != nil {
 				or.LogError(fmt.Errorf("Error removing local file '%s' after publishing: %s", sourcePath, err))
 			}
-			or.LogMessage(fmt.Sprintf("Finished publishing %s", pubFile))
 
+			// TODO: inject a "success" message into the pipeline
 		}
 	}
 
