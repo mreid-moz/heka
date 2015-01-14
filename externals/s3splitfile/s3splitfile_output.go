@@ -432,10 +432,12 @@ func (o *S3SplitFileOutput) finalizeOne(fi *SplitFileInfo) (err error) {
 		return fmt.Errorf("S3SplitFileOutput can't create the finalized path %s: %s", newPath, err)
 	}
 
+	err = os.Rename(oldName, newName)
+
 	// Queue finalized file up for publishing.
 	o.publishChan <- fi.name
 
-	return os.Rename(oldName, newName)
+	return
 }
 
 func (o *S3SplitFileOutput) getNewFilename() (name string) {
@@ -593,10 +595,16 @@ func (o *S3SplitFileOutput) publisher(or OutputRunner, wg *sync.WaitGroup) {
 			err = o.bucket.PutReader(destPath, reader, fi.Size(), "binary/octet-stream", s3.BucketOwnerFull, s3.Options{})
 			if err != nil {
 				or.LogError(fmt.Errorf("Error publishing %s to s3://%s%s: %s", sourcePath, o.S3Bucket, destPath, err))
+				// TODO: retry? add a struct for {name, numAttempts}, increment it, and push it back on the channel?
 				continue
 			}
 
 			or.LogMessage(fmt.Sprintf("Successfully published %s", pubFile))
+
+			err = reader.Close()
+			if err != nil {
+				or.LogError(fmt.Errorf("Error closing file %s: %s", sourcePath, err))
+			}
 
 			err = os.Remove(sourcePath)
 			if err != nil {
