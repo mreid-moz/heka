@@ -32,7 +32,12 @@ type S3SplitFileOutput struct {
 	dimFiles   map[string]*SplitFileInfo
 	schema     Schema
 	bucket     *s3.Bucket
-	publishChan chan string
+	publishChan chan PublishAttempt
+}
+
+type PublishAttempt struct {
+	Name string
+	AttemptsRemaining uint32
 }
 
 // ConfigStruct for S3SplitFileOutput plugin.
@@ -75,7 +80,8 @@ type S3SplitFileOutputConfig struct {
 	AWSRegion string `toml:"aws_region"`
 	S3Bucket string `toml:"s3_bucket"`
 	S3BucketPrefix string `toml:"s3_bucket_prefix"`
-	// TODO: S3WorkerCount int
+	S3Retries uint32 `toml:"s3_retries"`
+	S3WorkerCount uint32 `toml:"s3_worker_count"`
 }
 
 // Info for a single split file
@@ -219,6 +225,8 @@ func (o *S3SplitFileOutput) ConfigStruct() interface{} {
 		AWSRegion:      "us-west-2",
 		S3Bucket:       "",
 		S3BucketPrefix: "",
+		S3Retries:      5,
+		S3WorkerCount:  10,
 	}
 }
 
@@ -345,7 +353,7 @@ func (o *S3SplitFileOutput) Init(config interface{}) (err error) {
 	// Remove any excess path separators from the bucket prefix.
 	conf.S3BucketPrefix = fmt.Sprintf("/%s", strings.Trim(conf.S3BucketPrefix, "/"))
 
-	o.publishChan = make(chan string, 1000)
+	o.publishChan = make(chan PublishAttempt, 1000)
 
 	return
 }
@@ -435,7 +443,7 @@ func (o *S3SplitFileOutput) finalizeOne(fi *SplitFileInfo) (err error) {
 	err = os.Rename(oldName, newName)
 
 	// Queue finalized file up for publishing.
-	o.publishChan <- fi.name
+	o.publishChan <- PublishAttempt{fi.name, o.S3Retries}
 
 	return
 }
@@ -558,8 +566,23 @@ func (o *S3SplitFileOutput) receiver(or OutputRunner, wg *sync.WaitGroup) {
 	wg.Done()
 }
 
+// Retry the given PublishAttempt by pushing it back on the channel with one
+// less attempt.  If we're out of retries, just log the error.
+// TODO: If we fail to publish a file, we should inject a failure message back
+//       into the pipeline.
+func (o *S3SplitFileOutput) retryPublish(attempt PublishAttempt, or OutputRunner, err error) {
+	if attempt.AttemptsRemaining > 0 {
+		or.LogError(fmt.Errorf("Partial failure, will try %d more time(s): %s", attempt.AttemptsRemaining, err))
+		o.publishChan <- PublishAttempt{attempt.Name, attempt.AttemptsRemaining - 1}
+		return
+	}
+
+	or.LogError(err)
+}
+
 func (o *S3SplitFileOutput) publisher(or OutputRunner, wg *sync.WaitGroup) {
 	// var err error
+	var pubAttempt PublishAttempt
 	var pubFile string
 	var startTime time.Time
 	var duration float64
@@ -570,25 +593,25 @@ func (o *S3SplitFileOutput) publisher(or OutputRunner, wg *sync.WaitGroup) {
 
 	for ok {
 		select {
-		case pubFile, ok = <-o.publishChan:
+		case pubAttempt, ok = <-o.publishChan:
 			if !ok {
 				// Channel is closed => we're shutting down, exit cleanly.
 				break
 			}
+
+			pubFile = pubAttempt.Name
 
 			if o.bucket == nil {
 				or.LogMessage(fmt.Sprintf("Dude, where's my bucket: %s", pubFile))
 				continue
 			}
 
-			// TODO: if we fail to publish a file, we should inject a failure
-			//       message back into the pipeline.
 
 			sourcePath := o.getFinalizedFileName(pubFile)
 			destPath := fmt.Sprintf("%s/%s", o.S3BucketPrefix, pubFile)
 			reader, err := os.Open(sourcePath)
 			if err != nil {
-				or.LogError(fmt.Errorf("Error opening %s for reading: %s", sourcePath, err))
+				o.retryPublish(pubAttempt, or, fmt.Errorf("Error opening %s for reading: %s", sourcePath, err))
 				continue
 			}
 
@@ -601,8 +624,7 @@ func (o *S3SplitFileOutput) publisher(or OutputRunner, wg *sync.WaitGroup) {
 			startTime = time.Now().UTC()
 			err = o.bucket.PutReader(destPath, reader, fi.Size(), "binary/octet-stream", s3.BucketOwnerFull, s3.Options{})
 			if err != nil {
-				or.LogError(fmt.Errorf("Error publishing %s to s3://%s%s: %s", sourcePath, o.S3Bucket, destPath, err))
-				// TODO: retry? add a struct for {name, numAttempts}, increment it, and push it back on the channel?
+				o.retryPublish(pubAttempt, or, fmt.Errorf("Error publishing %s to s3://%s%s: %s", sourcePath, o.S3Bucket, destPath, err))
 				continue
 			}
 			duration = time.Now().UTC().Sub(startTime).Seconds()
