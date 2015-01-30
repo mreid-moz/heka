@@ -329,6 +329,15 @@ func S3FileIterator(bucket *s3.Bucket, s3Key string) <-chan S3Record {
 	return recordChannel
 }
 
+func makeS3Record(bytesRead int, data []byte, err error) (result S3Record) {
+	r := S3Record{}
+	r.BytesRead = bytesRead
+	r.Err = err
+	r.Record = make([]byte, len(data))
+	copy(r.Record, data)
+	return r
+}
+
 func ReadS3File(bucket *s3.Bucket, s3Key string, recordChan chan S3Record) {
 	defer close(recordChan)
 	parser := NewMessageProtoParser()
@@ -346,6 +355,7 @@ func ReadS3File(bucket *s3.Bucket, s3Key string, recordChan chan S3Record) {
 		//runner.LogMessage(fmt.Sprintf("Reading message %d from %s", recordCount, s3Key))
 		n, record, err := parser.Parse(reader)
 		size += int64(n)
+
 		if err != nil {
 			//runner.LogError(fmt.Errorf("Error reading S3: %s", err))
 			if err == io.EOF {
@@ -357,12 +367,12 @@ func ReadS3File(bucket *s3.Bucket, s3Key string, recordChan chan S3Record) {
 				}
 				done = true
 			} else if err == io.ErrShortBuffer {
-				recordChan <- S3Record{n, record, fmt.Errorf("record exceeded MAX_RECORD_SIZE %d", message.MAX_RECORD_SIZE)}
+				recordChan <- makeS3Record(n, record, fmt.Errorf("record exceeded MAX_RECORD_SIZE %d", message.MAX_RECORD_SIZE))
 				continue
 			} else {
 				// Some kind of unknown error occurred.
 				// TODO: retry? Keep a key->offset counter and start over?
-				recordChan <- S3Record{n, record, err}
+				recordChan <- makeS3Record(n, record, err)
 				return
 			}
 
@@ -375,7 +385,7 @@ func ReadS3File(bucket *s3.Bucket, s3Key string, recordChan chan S3Record) {
 			continue
 		}
 
-		recordChan <- S3Record{n, record, nil}
+		recordChan <- makeS3Record(n, record, nil)
 
 		// pack = <-packSupply
 		// recordCount += 1
