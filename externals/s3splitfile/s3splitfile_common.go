@@ -9,9 +9,12 @@ package s3splitfile
 import (
 	"fmt"
 	. "github.com/mozilla-services/heka/pipeline"
+	"github.com/mozilla-services/heka/message"
 	"regexp"
+	"io"
 	"io/ioutil"
 	"encoding/json"
+	"github.com/crowdmob/goamz/s3"
 )
 
 type PublishAttempt struct {
@@ -131,10 +134,37 @@ func (rdc RangeDimensionChecker) IsAllowed(v string) (bool) {
 // Pattern to use for sanitizing path/file components.
 var sanitizePattern = regexp.MustCompile("[^a-zA-Z0-9_/.]")
 
+// Given a string, return a sanitized version that can be used safely as part
+// of a filename (for example).
 func SanitizeDimension(dim string) (cleaned string) {
     return sanitizePattern.ReplaceAllString(dim, "_")
 }
 
+// Load a schema from the given file name.  The file is expected to contain
+// valid JSON describing a hierarchy of dimensions, each of which specifies
+// what values are "allowed" for that dimension.
+// Example schema:
+//   {
+//     "version": 1,
+//     "dimensions": [
+//       { "field_name": "submissionDate", "allowed_values": {
+//           { "min": "20140120", "max": "20140125" }
+//       },
+//       { "field_name": "sourceName",     "allowed_values": "*" },
+//       { "field_name": "sourceVersion",  "allowed_values": "*" },
+//       { "field_name": "reason",         "allowed_values":
+//           [ "idle-daily","saved-session" ]
+//       },
+//       { "field_name": "appName",        "allowed_values":
+//           [ "Firefox", "Fennec", "Thunderbird", "FirefoxOS", "B2G" ]
+//       },
+//       { "field_name": "appUpdateChannel",
+//         "allowed_values":
+//           [ "default", "nightly", "aurora", "beta", "release", "esr" ]
+//       },
+//       { "field_name": "appVersion",     "allowed_values": "*" }
+//     ]
+//   }
 func LoadSchema(schemaFileName string) (schema Schema, err error) {
 	// Placeholder for parsing JSON
 	type JSchemaDimension struct {
@@ -198,5 +228,180 @@ func LoadSchema(schemaFileName string) (schema Schema, err error) {
 			schema.Dims[d.Field_name] = RangeDimensionChecker{minStr, maxStr}
 		}
 	}
+	return
+}
+
+// Maximum number of S3 List results to fetch at once.
+const listBatchSize = 1000
+
+// Maximum number of S3 Record results to queue at once.
+const fileBatchSize = 300
+
+// Encapsulates the result of a List operation, allowing detection of errors
+// along the way.
+type S3Result struct {
+	Key s3.Key
+	Err error
+}
+
+// List the contents of the given bucket, sending matching filenames to a
+// channel which can be read by the caller.
+func S3Iterator(bucket *s3.Bucket, prefix string, schema Schema) <-chan S3Result {
+	keyChannel := make(chan S3Result, listBatchSize)
+	go FilterS3(bucket, prefix, 0, schema, keyChannel)
+	return keyChannel
+}
+
+// Recursively descend into an S3 directory tree, filtering based on the given
+// schema, and sending results on the given channel. The `level` parameter
+// indicates how far down the tree we are, and is used to determine which schema
+// field we use for filtering.
+func FilterS3(bucket *s3.Bucket, prefix string, level int, schema Schema, kc chan S3Result) {
+    // Update the marker as we encounter keys / prefixes. If a response is
+    // truncated, the next `List` request will start from the next item after
+    // the marker.
+    marker := ""
+
+    // Keep listing if the response is incomplete (there are more than
+    // `listBatchSize` entries or prefixes)
+	done := false
+    for !done {
+	    response, err := bucket.List(prefix, "/", marker, listBatchSize)
+		if err != nil {
+			fmt.Printf("Error listing: %s\n", err)
+			// TODO: retry?
+			kc <- S3Result{s3.Key{}, err}
+		}
+
+		if !response.IsTruncated {
+			// Response is not truncated, so we're done.
+			done = true
+		}
+
+		if level >= len(schema.Fields) {
+			// We are past all the dimensions - encountered items are now
+			// S3 key names. We ignore any further prefixes and assume that the
+			// specified schema is correct/complete.
+			for _, k := range response.Contents {
+				marker = k.Key
+				kc <- S3Result{k, nil}
+			}
+		} else {
+			// We are still looking at prefixes. Recursively list each one that
+			// matches the specified schema's allowed values.
+			for _, pf := range response.CommonPrefixes {
+				// Get just the last piece of the prefix to check it as a
+				// dimension. If we have '/foo/bar/baz', we just want 'baz'.
+				stripped := pf[len(prefix):len(pf)-1]
+				allowed := schema.Dims[schema.Fields[level]].IsAllowed(stripped)
+				marker = pf
+				if allowed {
+					FilterS3(bucket, pf, level + 1, schema, kc)
+				}
+			}
+		}
+	}
+
+	if level == 0 {
+		// We traverse the tree in depth-first order, so once we've reached the
+		// end at the root (level 0), we know we're done.
+		// Note that things could be made faster by parallelizing the recursive
+		// listing, but we would need some other mechanism to know when to close
+		// the channel?
+		close(kc)
+	}
+	return
+}
+
+// Encapsulates a single record within an S3 file, allowing detection of errors
+// along the way.
+type S3Record struct {
+	BytesRead int
+	Record []byte
+	Err error
+}
+
+// List the contents of the given bucket, sending matching filenames to a
+// channel which can be read by the caller.
+func S3FileIterator(bucket *s3.Bucket, s3Key string) <-chan S3Record {
+	recordChannel := make(chan S3Record, fileBatchSize)
+	go ReadS3File(bucket, s3Key, recordChannel)
+	return recordChannel
+}
+
+func ReadS3File(bucket *s3.Bucket, s3Key string, recordChan chan S3Record) {
+	defer close(recordChan)
+	parser := NewMessageProtoParser()
+	reader, err := bucket.GetReader(s3Key)
+	if err != nil {
+		recordChan <- S3Record{0, []byte{}, err}
+		return
+	}
+	defer reader.Close()
+
+	var size int64
+
+	done := false
+	for !done {
+		//runner.LogMessage(fmt.Sprintf("Reading message %d from %s", recordCount, s3Key))
+		n, record, err := parser.Parse(reader)
+		size += int64(n)
+		if err != nil {
+			//runner.LogError(fmt.Errorf("Error reading S3: %s", err))
+			if err == io.EOF {
+				fmt.Printf("Success: Reached EOF in %s at offset: %d, n=%d, len(record)=%d\n", s3Key, size, n, len(record))
+				if len(record) == 0 {
+					// runner.LogMessage("At EOF, record was empty.")
+					record = parser.GetRemainingData()
+					// runner.LogMessage(fmt.Sprintf("At EOF, RemainingData was %d", len(record)))
+				}
+				done = true
+			} else if err == io.ErrShortBuffer {
+				recordChan <- S3Record{n, record, fmt.Errorf("record exceeded MAX_RECORD_SIZE %d", message.MAX_RECORD_SIZE)}
+				continue
+			} else {
+				// Some kind of unknown error occurred.
+				// TODO: retry? Keep a key->offset counter and start over?
+				recordChan <- S3Record{n, record, err}
+				return
+			}
+
+		}
+		if n > 0 && n != len(record) {
+			fmt.Printf("Corruption detected in %s at offset: %d bytes: %d. n=%d, len(record)=%d\n", s3Key, size, n-len(record), n, len(record))
+		}
+		if len(record) == 0 && !done {
+			// Why does this happen before EOF?
+			continue
+		}
+
+		recordChan <- S3Record{n, record, nil}
+
+		// pack = <-packSupply
+		// recordCount += 1
+		// headerLen := int(record[1]) + message.HEADER_FRAMING_SIZE
+		// messageLen := len(record) - headerLen
+		// // TODO: signed messages?
+		// if messageLen > cap(pack.MsgBytes) {
+		// 	pack.MsgBytes = make([]byte, messageLen)
+		// }
+		// pack.MsgBytes = pack.MsgBytes[:messageLen]
+		// copy(pack.MsgBytes, record[headerLen:])
+
+		// TODO: support a `matcher`?
+		// if err = proto.Unmarshal(record[headerLen:], msg); err != nil {
+		// 	runner.LogError(fmt.Errorf("Error unmarshalling message in '%s' at offset: %d error: %s\n", s3Key, size, err))
+		// 	pack.Recycle()
+		// 	continue
+		// }
+
+		// if !match.Match(msg) {
+		// 	continue
+		// }
+		// matched += 1
+
+		// dr.InChan() <- pack
+	}
+
 	return
 }

@@ -16,8 +16,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	//"io/ioutil"
-	//"encoding/json"
 	"github.com/crowdmob/goamz/aws"
 	"github.com/crowdmob/goamz/s3"
 )
@@ -162,6 +160,7 @@ func (o *S3SplitFileOutput) Init(config interface{}) (err error) {
 			return fmt.Errorf("Parameter 'aws_region' must be a valid AWS Region")
 		}
 		s := s3.New(auth, region)
+		// TODO: ensure we can write to the bucket.
 		o.bucket = s.Bucket(conf.S3Bucket)
 	} else {
 		o.bucket = nil
@@ -291,11 +290,14 @@ func (o *S3SplitFileOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 		}
 	}
 
-	var wg sync.WaitGroup
+	var (
+		wg sync.WaitGroup
+		i uint32
+	)
 	wg.Add(1)
 	go o.receiver(or, &wg)
 	// Run a pool of concurrent publishers.
-	for i := 0; i < 10; i++ {
+	for i = 0; i < o.S3WorkerCount; i++ {
 		wg.Add(1)
 		go o.publisher(or, &wg)
 	}
