@@ -8,25 +8,24 @@
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
-#   Mike Trinkala (trink@mozilla.com)
+#   Mark Reid (mreid@mozilla.com)
 # ***** END LICENSE BLOCK *****/
 
 /*
 
 A command-line utility for counting, viewing, filtering, and extracting Heka
-protobuf logs.
+protobuf logs from files on Amazon S3.
 
 */
 package main
 
 import (
+	"bufio"
 	"code.google.com/p/gogoprotobuf/proto"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"github.com/mozilla-services/heka/message"
-	// "github.com/mozilla-services/heka/pipeline"
-	// "io"
 	"os"
 	"time"
 	"github.com/crowdmob/goamz/aws"
@@ -38,15 +37,14 @@ func main() {
 	flagMatch := flag.String("match", "TRUE", "message_matcher filter expression")
 	flagFormat := flag.String("format", "txt", "output format [txt|json|heka|count]")
 	flagOutput := flag.String("output", "", "output filename, defaults to stdout")
-	// flagStdin := flag.Bool("stdin", false, "read list of s3 key names from stdin")
+	flagStdin := flag.Bool("stdin", false, "read list of s3 key names from stdin")
     flagBucket := flag.String("bucket", "default-bucket", "S3 Bucket name")
     flagAWSKey := flag.String("aws-key", "DUMMY", "AWS Key")
     flagAWSSecretKey := flag.String("aws-secret-key", "DUMMY", "AWS Secret Key")
     flagAWSRegion := flag.String("aws-region", "us-west-2", "AWS Region")
 	flag.Parse()
 
-	// if !*flagStdin && flag.NArg() < 1 {
-	if flag.NArg() != 1 {
+	if !*flagStdin && flag.NArg() < 1 {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
@@ -78,27 +76,24 @@ func main() {
 	s := s3.New(auth, region)
 	bucket := s.Bucket(*flagBucket)
 
-	fmt.Printf("Input:%s  Match:%s  Format:%s  Output:%s\n",
-		flag.Arg(0), *flagMatch, *flagFormat, *flagOutput)
-
-	cat(bucket, flag.Arg(0), match, *flagFormat, out)
+	if *flagStdin {
+		scanner := bufio.NewScanner(os.Stdin)
+	    for scanner.Scan() {
+	        filename := scanner.Text()
+			cat(bucket, filename, match, *flagFormat, out)
+	    }
+	} else {
+		for _, filename := range flag.Args() {
+			cat(bucket, filename, match, *flagFormat, out)
+		}
+	}
 }
 
 func cat(bucket *s3.Bucket, s3Key string, match *message.MatcherSpecification, format string, out *os.File) {
-	// file, err := bucket.GetReader(s3Key)
-	// if err != nil {
-	// 	fmt.Printf("Error getting a reader: %s", err)
-	// 	return
-	// }
-	// defer file.Close()
-
 	var offset, processed, matched int64
 	msg := new(message.Message)
 
 	for r := range s3splitfile.S3FileIterator(bucket, s3Key) {
-		// if processed > 1 {
-		// 	break
-		// }
 		n := r.BytesRead
 		record := r.Record
 		err := r.Err
@@ -110,16 +105,7 @@ func cat(bucket *s3.Bucket, s3Key string, match *message.MatcherSpecification, f
 				processed += 1
 				headerLen := int(record[1]) + message.HEADER_FRAMING_SIZE
 				if err = proto.Unmarshal(record[headerLen:], msg); err != nil {
-					fmt.Printf("Error unmarshalling message %d at offset: %d error: %s (n=%d, len(rec)=%d)\n", processed, offset, err, n, len(record))
-					// for j := 0; j < len(record); j += 20 {
-					// 	for i := 0; i < 20; i++ {
-					// 		if i + j >= len(record) {
-					// 			return
-					// 		}
-					// 		fmt.Printf("%d ", record[i+j])
-					// 	}
-					// 	fmt.Print("\n");
-					// }
+					fmt.Printf("Error unmarshalling message %d at offset: %d error: %s\n", processed, offset, err)
 					continue
 				}
 
@@ -159,8 +145,4 @@ func cat(bucket *s3.Bucket, s3Key string, match *message.MatcherSpecification, f
 	}
 
 	fmt.Printf("Processed: %d, matched: %d messages\n", processed, matched)
-	// if err != nil {
-	// 	fmt.Printf("%s\n", err)
-	// 	// os.Exit(6)
-	// }
 }
