@@ -13,7 +13,7 @@
 
 /*
 
-A command-line utility for exporting heka output files to Amazon S3.
+A command-line utility for listing files on Amazon S3, filtered by dimension.
 
 */
 package main
